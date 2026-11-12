@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const hoisted = vi.hoisted(() => {
   const eventHandlers = new Map<string, (...args: unknown[]) => void>();
@@ -16,6 +16,7 @@ const hoisted = vi.hoisted(() => {
   const webLinksAddonDisposeSpy = vi.fn();
   const setWebglEnabledSpy = vi.fn();
   const reportWebglFailureSpy = vi.fn();
+  const themeUnsubscribeSpy = vi.fn();
   const browserOpenURLSpy = vi.fn();
   const linkProviderDisposeSpy = vi.fn();
   const attachUrlHighlighterSpy = vi.fn();
@@ -55,6 +56,7 @@ const hoisted = vi.hoisted(() => {
     webLinksAddonDisposeSpy,
     setWebglEnabledSpy,
     reportWebglFailureSpy,
+    themeUnsubscribeSpy,
     browserOpenURLSpy,
     linkProviderDisposeSpy,
     attachUrlHighlighterSpy,
@@ -106,6 +108,7 @@ vi.mock("../../wailsjs/go/local/Local", () => ({
 vi.mock("@xterm/xterm", () => {
   class MockTerminal {
     rows = 24;
+    cols = 80;
     buffer = {
       active: {
         baseY: 0,
@@ -114,7 +117,12 @@ vi.mock("@xterm/xterm", () => {
         length: 24,
         getLine: (lineNumber: number) => {
           const line = hoisted.state.lines.get(lineNumber);
-          return line === undefined ? undefined : { translateToString: () => line };
+          return line === undefined
+            ? undefined
+            : {
+                translateToString: () => line,
+                getCell: (x: number) => ({ getChars: () => line[x] ?? " " }),
+              };
         },
       },
     };
@@ -130,7 +138,12 @@ vi.mock("@xterm/xterm", () => {
       return { dispose: vi.fn() };
     });
     onWriteParsed = vi.fn(() => ({ dispose: vi.fn() }));
+    onScroll = vi.fn(() => ({ dispose: vi.fn() }));
+    onResize = vi.fn(() => ({ dispose: vi.fn() }));
     onRender = vi.fn(() => ({ dispose: vi.fn() }));
+    // 自定义高亮 addon 用 marker + decoration 给权限位上色（#permissions highlight）。
+    registerMarker = vi.fn(() => ({ dispose: vi.fn() }));
+    registerDecoration = vi.fn(() => ({ dispose: vi.fn() }));
     // OSC 52 剪贴板透传在 term.parser 上注册处理器（见 terminalOsc52）。
     parser = { registerOscHandler: vi.fn(() => ({ dispose: vi.fn() })) };
     attachCustomKeyEventHandler = vi.fn();
@@ -275,14 +288,22 @@ vi.mock("@/stores/terminalStore", async (importActual) => {
   };
 });
 
-vi.mock("@/stores/terminalThemeStore", () => ({
-  useTerminalThemeStore: {
-    getState: () => ({
-      setWebglEnabled: hoisted.setWebglEnabledSpy,
-      reportWebglFailure: hoisted.reportWebglFailureSpy,
-    }),
-  },
-}));
+vi.mock("@/stores/terminalThemeStore", async () => {
+  const { builtinThemes } = await import("@/data/terminalThemes");
+  const activeTheme = builtinThemes[0];
+  return {
+    useTerminalThemeStore: {
+      getState: () => ({
+        selectedThemeId: activeTheme.id,
+        customThemes: [],
+        setWebglEnabled: hoisted.setWebglEnabledSpy,
+        reportWebglFailure: hoisted.reportWebglFailureSpy,
+        getActiveTheme: () => activeTheme,
+      }),
+      subscribe: () => hoisted.themeUnsubscribeSpy,
+    },
+  };
+});
 
 vi.mock("@/data/terminalFonts", () => ({
   withTerminalFontFallback: (s: string) => s,
@@ -304,6 +325,8 @@ import {
   uploadFilesWithRz,
 } from "@/components/terminal/terminalRegistry";
 import { TRANSPORTS, transportForAsset, inferTransportFromSessionId } from "@/stores/terminalStore";
+import { CustomHighlightAddon } from "@/components/terminal/addons/customHighlightAddon";
+import { builtinThemes, defaultDarkTheme } from "@/data/terminalThemes";
 import { WriteSSH } from "../../wailsjs/go/ssh/SSH";
 import { ReadClipboardText } from "../../wailsjs/go/system/System";
 
@@ -352,6 +375,7 @@ describe("TRANSPORTS", () => {
 
 describe("terminalRegistry", () => {
   beforeEach(() => {
+    hoisted.themeUnsubscribeSpy.mockClear();
     hoisted.eventHandlers.clear();
     hoisted.state.capturedOnKey = null;
     hoisted.state.linkProvider = null;
@@ -676,5 +700,24 @@ describe("terminalRegistry", () => {
     getOrCreateTerminal("sess-5", { fontSize: 14, fontFamily: "mono", scrollback: 1000 });
     expect(hoisted.terminalCtor.mock.calls.length).toBe(before + 2);
     disposeTerminal("sess-5");
+  });
+});
+
+describe("terminal permission highlight", () => {
+  beforeEach(() => hoisted.themeUnsubscribeSpy.mockClear());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("按 store 的当前主题解析高亮色，销毁终端时取消主题订阅", () => {
+    const setRules = vi.spyOn(CustomHighlightAddon.prototype, "setRules").mockImplementation(() => {});
+    // 当前主题与写死的默认暗色主题的 green 不同，断言才有区分力。
+    expect(builtinThemes[0].green).not.toBe(defaultDarkTheme.green);
+
+    getOrCreateTerminal("sess-perm-highlight", { fontSize: 14, fontFamily: "mono", scrollback: 1000 });
+
+    const rules = setRules.mock.calls[0]?.[0];
+    expect(rules?.[0]?.charColorMap?.["r"]).toBe(builtinThemes[0].green);
+
+    disposeTerminal("sess-perm-highlight");
+    expect(hoisted.themeUnsubscribeSpy).toHaveBeenCalledTimes(1);
   });
 });

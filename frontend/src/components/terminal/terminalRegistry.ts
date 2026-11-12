@@ -20,6 +20,7 @@ import { attachTerminalUrlHighlighter, type TerminalUrlHighlighterController } f
 import { attachTerminalClipboardOsc52, type TerminalClipboardOsc52Controller } from "./terminalOsc52";
 import { normalizeHttpUrl } from "./terminalUrlScan";
 import { errorMessage } from "@/lib/errorMessage";
+import { TerminalHighlightController } from "@/components/terminal/applyTerminalHighlight";
 
 const PENDING_RZ_UPLOAD_TTL_MS = 10_000;
 
@@ -76,6 +77,16 @@ export function getOrCreateTerminal(
     fontFamily: withTerminalFontIsolation(sessionId, resolvedFontFamily),
     theme: init.theme,
     scrollback: init.scrollback,
+  });
+
+  // 权限位等自定义高亮：语义色来自当前终端主题，切换主题或编辑自定义主题色时重新解析。
+  const highlight = new TerminalHighlightController(term);
+  const themeStore = useTerminalThemeStore;
+  highlight.applyTheme(themeStore.getState().getActiveTheme());
+  const unsubscribeTheme = themeStore.subscribe((state, prev) => {
+    if (state.selectedThemeId !== prev.selectedThemeId || state.customThemes !== prev.customThemes) {
+      highlight.applyTheme(state.getActiveTheme());
+    }
   });
 
   const fitAddon = new FitAddon();
@@ -283,6 +294,8 @@ export function getOrCreateTerminal(
       clipboardOsc52.dispose();
       rolloverGuard.dispose();
       zmodem?.dispose();
+      highlight.dispose();
+      unsubscribeTheme();
       onDataDispose.dispose();
       onKeyDispose.dispose();
       term.textarea?.removeEventListener("paste", onNativePasteCapture, true);
